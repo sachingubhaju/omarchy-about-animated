@@ -1,0 +1,10 @@
+#!/bin/bash
+# omarchy-about — open the animated Omarchy About screen.
+#
+# Closes a static About left behind by `omarchy branding about ...` (that
+# command ends by calling omarchy-launch-about), so the animated window always
+# wins the org.omarchy.about app-id.
+
+pkill -f "omarchy-launch-about --render" 2>/dev/null
+
+exec omarchy-launch-or-focus-tui --app-id=org.omarchy.about omarchy-about-animated

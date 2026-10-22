@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""omarchy-about-animated
+
+The Omarchy About screen, unchanged: the same ASCII logo from
+~/.config/omarchy/branding/about.txt and the same three fastfetch boxes
+(Hardware / Software / Age-Uptime-Update) laid out exactly like
+`omarchy-launch-about` does it.
+
+The only difference is that the logo is lit by a slow accent-coloured sheen
+sweeping across it, so the shape stays crisp and every detail is preserved.
+
+Colours follow the active Omarchy theme automatically.
+"""
+
+import json
+import math
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+HOME = os.path.expanduser("~")
+LOGO_FILE = os.path.join(HOME, ".config/omarchy/branding/about.txt")
+THEME_STATE = os.path.join(HOME, ".local/state/omarchy/current")
+APP_ID = "org.omarchy.about"
+
+# Layout padding: 2 columns left of the logo, 6 columns between the logo and
+# the boxes, 2 columns of right padding.
+PAD_LEFT = 2
+GAP = 6
+PAD_RIGHT = 2
+
+# Breathing room above and below the logo, in rows. The logo spans the box
+# stack minus this inset on each side, so it sits inside the frame instead of
+# touching the top and bottom borders.
+LOGO_INSET = 2
+
+FPS = 24
+ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def vlen(text):
+    """Visible columns, counting box drawing and Nerd Font glyphs as one."""
+    return len(ANSI.sub("", text))
+
+
+def accent_rgb():
+    """The active theme's accent colour, defaulting to Omarchy pink."""
+    try:
+        with open(os.path.join(THEME_STATE, "theme/colors.toml"), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return (255, 20, 147)
+
+    match = re.search(r'^accent\s*=\s*"#?([0-9a-fA-F]{6})"', text, re.M)
+    if not match:
+        return (255, 20, 147)
+
+    value = match.group(1)
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def load_logo():
+    try:
+        with open(LOGO_FILE, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+    except OSError:
+        return []
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    width = max((len(line) for line in lines), default=0)
+    return [line.ljust(width) for line in lines]
+
+
+def load_info():
+    try:
+        result = subprocess.run(
+            ["fastfetch", "--logo", "none"],
+            capture_output=True, text=True, timeout=25,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    lines = result.stdout.split("\n")
+
+    # Drop fastfetch's blank padding rows. The About window is sized from the
+    # boxes themselves, so keeping them would leave an empty band above the
+    # Hardware box and another below the Update box.
+    def blank(line):
+        return not ANSI.sub("", line).strip()
+
+    while lines and blank(lines[-1]):
+        lines.pop()
+    while lines and blank(lines[0]):
+        lines.pop(0)
+
+    return lines
+
+
+def hypr_client():
+    try:
+        output = subprocess.run(
+            ["hyprctl", "clients", "-j"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        clients = json.loads(output)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+    for client in clients:
+        if client.get("class") == APP_ID:
+            return client
+    return None
+
+
+def grid_size():
+    """The terminal's real grid. Never trust COLUMNS/LINES from the environment."""
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+    except OSError:
+        return (120, 32)
+    return size.columns, size.lines
+
+
+def debug(message):
+    if not os.environ.get("OMARCHY_ABOUT_DEBUG"):
+        return
+    path = os.environ.get(
+        "OMARCHY_ABOUT_DEBUG_FILE",
+        os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-about-animated.log"),
+    )
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+    except OSError:
+        pass
+
+
+def settle(timeout=1.5):
+    """Wait until the terminal grid stops moving."""
+    deadline = time.monotonic() + timeout
+    previous = None
+    held = 0
+    while time.monotonic() < deadline:
+        current = grid_size()
+        if current == previous:
+            held += 1
+            if held >= 3:
+                return current
+        else:
+            held = 0
+            previous = current
+        time.sleep(0.05)
+    return grid_size()
+
+
+def fit_window(target_cols, target_rows):
+    """Grow or shrink the float window until it hugs the content.
+
+    Sizing rounds up: one spare cell is invisible, a missing one clips the
+    bottom box (which is how the Update row used to disappear).
+    """
+    for attempt in range(6):
+        cols, rows = grid_size()
+        debug("fit attempt %d: grid=%dx%d target=%dx%d" % (attempt, cols, rows, target_cols, target_rows))
+        if cols == target_cols and rows == target_rows:
+            debug("fit ok")
+            return
+
+        client = hypr_client()
+        if not client:
+            debug("fit: no client")
+            return
+
+        width, height = client.get("size", [0, 0])
+        if not width or not height or not cols or not rows:
+            debug("fit: bad geometry")
+            return
+
+        cell_w = width / cols
+        cell_h = height / rows
+        new_w = max(320, math.ceil(width + (target_cols - cols) * cell_w))
+        new_h = max(200, math.ceil(height + (target_rows - rows) * cell_h))
+        debug("fit resize -> %dx%d (cell %.2fx%.2f)" % (new_w, new_h, cell_w, cell_h))
+
+        subprocess.run(
+            ["hyprctl", "dispatch",
+             'hl.dsp.window.resize({window="address:%s", x=%d, y=%d})'
+             % (client["address"], new_w, new_h)],
+            capture_output=True,
+        )
+        settle()
+
+
+def mix(a, b, amount):
+    return tuple(round(a[i] + (b[i] - a[i]) * amount) for i in range(3))
+
+
+def paint(logo, elapsed, base):
+    """Return the logo rows with a moving accent sheen, as ANSI strings."""
+    highlight = mix(base, (255, 255, 255), 0.82)
+    glow = mix(base, (255, 255, 255), 0.28)
+
+    rows = []
+    for y, line in enumerate(logo):
+        cells = []
+        for x, char in enumerate(line):
+            if char == " ":
+                cells.append(" ")
+                continue
+
+            # Diagonal band travelling across the logo, sharpened so it reads
+            # as a glint rather than a flat gradient.
+            wave = math.sin(x * 0.26 + y * 0.46 - elapsed * 2.2)
+            sheen = max(0.0, wave) ** 6
+
+            # A slow breath keeps the whole mark alive between glints.
+            breath = 0.5 + 0.5 * math.sin(elapsed * 0.9)
+            colour = mix(mix(base, glow, 0.30 * breath), highlight, sheen)
+
+            cells.append("\033[38;2;%d;%d;%dm%s" % (colour[0], colour[1], colour[2], char))
+        rows.append("".join(cells) + "\033[0m")
+    return rows
+
+
+def info_bounds(info):
+    """First and last rows that actually draw something (the three boxes)."""
+    def blank(line):
+        return not ANSI.sub("", line).strip()
+
+    first = 0
+    while first < len(info) and blank(info[first]):
+        first += 1
+
+    last = len(info) - 1
+    while last >= 0 and blank(info[last]):
+        last -= 1
+
+    return first, last
+
+
+def stretch_rows(rows, target):
+    """Resample rows so the logo spans exactly as many lines as the boxes."""
+    count = len(rows)
+    if count == 0 or target <= 0 or count == target:
+        return rows
+
+    scaled = []
+    for index in range(target):
+        source = min(count - 1, (index * count) // target)
+        scaled.append(rows[source])
+    return scaled
+
+
+def layout_target(logo_rows, info):
+    """The tightest grid that still fits the logo and the three boxes."""
+    logo_w = vlen(logo_rows[0]) if logo_rows else 0
+    info_w = max((vlen(line.rstrip()) for line in info), default=0)
+    first, last = info_bounds(info)
+
+    content_rows = max(last + 1, first + len(logo_rows))
+    return (
+        PAD_LEFT + logo_w + GAP + info_w + PAD_RIGHT,
+        content_rows,
+    )
+
+
+def compose(logo_rows, info, cols, rows):
+    """Lay the logo and the boxes out with the logo boxed inside the stack.
+
+    The logo is stretched to the height of the boxes minus LOGO_INSET on each
+    side, so there is even breathing room above and below it.
+    """
+    logo_w = vlen(logo_rows[0]) if logo_rows else 0
+    first, last = info_bounds(info)
+
+    top = first + LOGO_INSET
+    bottom = last - LOGO_INSET
+    if bottom < top:
+        top, bottom = first, last
+
+    span = max(1, bottom - top + 1)
+    scaled = stretch_rows(logo_rows, span)
+    total = max(last + 1, top + span)
+
+    lines = []
+    for index in range(total):
+        logo_index = index - top
+        if 0 <= logo_index < len(scaled):
+            left = scaled[logo_index]
+        else:
+            left = " " * logo_w
+
+        right = info[index] if index < len(info) else ""
+        row = " " * PAD_LEFT + left + " " * GAP + right
+        lines.append(row.rstrip())
+
+    # Never draw more rows than the terminal has, so the frame stays stable.
+    return "\n".join(lines[:rows])
+
+
+def file_mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def main():
+    logo_raw = load_logo()
+    if not logo_raw:
+        print("omarchy-about-animated: %s missing" % LOGO_FILE)
+        return 1
+
+    info = load_info()
+    debug("startup: logo=%d info=%d bounds=%s target=%s"
+          % (len(logo_raw), len(info), info_bounds(info), layout_target(logo_raw, info)))
+    fit_window(*layout_target(logo_raw, info))
+    info = load_info() or info
+    fit_window(*layout_target(logo_raw, info))
+    info = load_info() or info
+
+    base = accent_rgb()
+    theme_file = os.path.join(THEME_STATE, "theme/colors.toml")
+    last_logo = file_mtime(LOGO_FILE)
+    last_theme = file_mtime(theme_file)
+
+    stdout = sys.stdout
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    started = time.monotonic()
+    last_size = grid_size()
+
+    try:
+        tty.setcbreak(fd)
+        stdout.write("\033[?25l")
+        stdout.flush()
+
+        while True:
+            cols, rows = grid_size()
+            if (cols, rows) != last_size:
+                last_size = (cols, rows)
+                info = load_info() or info
+
+            # Editing the logo (Style -> About -> Edit Text / Set From Image)
+            # repaints the open window instead of needing a relaunch.
+            logo_mtime = file_mtime(LOGO_FILE)
+            if logo_mtime != last_logo:
+                last_logo = logo_mtime
+                logo_raw = load_logo() or logo_raw
+                debug("logo reloaded: %d rows" % len(logo_raw))
+                info = load_info() or info
+                fit_window(*layout_target(logo_raw, info))
+                last_size = grid_size()
+
+            # Switching theme retints the sheen without reopening About.
+            theme_mtime = file_mtime(theme_file)
+            if theme_mtime != last_theme:
+                last_theme = theme_mtime
+                base = accent_rgb()
+
+            elapsed = time.monotonic() - started
+            logo_rows = paint(logo_raw, elapsed, base)
+            frame = compose(logo_rows, info, cols, rows)
+
+            stdout.write("\033[H\033[?2026h" + frame + "\033[?2026l")
+            stdout.flush()
+
+            if select.select([sys.stdin], [], [], max(0.0, 1.0 / FPS))[0]:
+                break
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        stdout.write("\033[0m\033[?25h")
+        stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
