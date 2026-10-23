@@ -32,7 +32,7 @@ It is a renderer, not a replacement: it reads the exact art from
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/omarchy-about-animated.git
+git clone https://github.com/sachingubhaju/omarchy-about-animated.git
 cd omarchy-about-animated
 ./install.sh
 ```

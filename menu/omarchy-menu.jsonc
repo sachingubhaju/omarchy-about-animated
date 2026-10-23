@@ -1,4 +1,4 @@
-  // Animated About — https://github.com/<your-username>/omarchy-about-animated
+  // Animated About — https://github.com/sachingubhaju/omarchy-about-animated
   // Reuse the stock ids so the About row and the logo editor reopen this build.
   "about": {"icon":"","label":"About","action":"omarchy-launch-or-focus-tui --app-id=org.omarchy.about $HOME/.local/bin/omarchy-about-animated"},
   "style.about.text": {"action":"omarchy-launch-editor $HOME/.config/omarchy/branding/about.txt >/dev/null 2>&1; omarchy-launch-or-focus-tui --app-id=org.omarchy.about $HOME/.local/bin/omarchy-about-animated"},
