@@ -7,4 +7,4 @@
 
 pkill -f "omarchy-launch-about --render" 2>/dev/null
 
-exec omarchy-launch-or-focus-tui --app-id=org.omarchy.about omarchy-about-animated
+exec omarchy-launch-or-focus-tui --app-id=org.omarchy.about omarchy-about-animated "$@"

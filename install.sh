@@ -39,4 +39,7 @@ then run:
 
 open it with:
   omarchy-about
+
+optional settings:
+  ~/.config/omarchy/about-animated.conf (see the README)
 EOF

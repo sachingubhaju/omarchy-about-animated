@@ -6,41 +6,70 @@ The Omarchy About screen, unchanged: the same ASCII logo from
 (Hardware / Software / Age-Uptime-Update) laid out exactly like
 `omarchy-launch-about` does it.
 
-The only difference is that the logo is lit by a slow accent-coloured sheen
-sweeping across it, so the shape stays crisp and every detail is preserved.
-
-Colours follow the active Omarchy theme automatically.
+The logo is lit by a slow sheen sweeping across it, so the shape stays crisp
+and every detail is preserved. Colours follow the active Omarchy theme by
+default; the accent can also follow the wallpaper, blend both, or be pinned
+to a fixed colour. See `--help` and ~/.config/omarchy/about-animated.conf.
 """
 
+import argparse
+import colorsys
+import configparser
 import json
 import math
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
+
+VERSION = "1.1.0"
 
 HOME = os.path.expanduser("~")
 LOGO_FILE = os.path.join(HOME, ".config/omarchy/branding/about.txt")
 THEME_STATE = os.path.join(HOME, ".local/state/omarchy/current")
+THEME_COLORS = os.path.join(THEME_STATE, "theme/colors.toml")
+BACKGROUND_LINK = os.path.join(THEME_STATE, "background")
+CONFIG_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+    "omarchy/about-animated.conf",
+)
+WALLPAPER_CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")),
+    "omarchy/about-animated-wallpaper.json",
+)
 APP_ID = "org.omarchy.about"
 
-# Layout padding: 2 columns left of the logo, 6 columns between the logo and
-# the boxes, 2 columns of right padding.
+# Layout padding: 2 columns left of the logo, 2 columns of right padding. The
+# gap and the logo inset come from the config file.
 PAD_LEFT = 2
-GAP = 6
 PAD_RIGHT = 2
 
-# Breathing room above and below the logo, in rows. The logo spans the box
-# stack minus this inset on each side, so it sits inside the frame instead of
-# touching the top and bottom borders.
-LOGO_INSET = 2
-
-FPS = 24
+DEFAULT_ACCENT = (255, 20, 147)
+WHITE = (255, 255, 255)
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+class Settings:
+    """Runtime options: config file first, environment and CLI on top."""
+
+    def __init__(self):
+        self.mode = "theme"          # theme | wallpaper | blend
+        self.glint = "white"         # white | theme
+        self.fps = 24
+        self.speed = 2.2
+        self.inset = 2
+        self.gap = 6
+        self.fade = 0.35
+        self.crossfade = 0.35
+        self.pause_unfocused = True
+        self.static = False
+        self.accent = None           # fixed (r, g, b), overrides the mode
 
 
 def vlen(text):
@@ -48,20 +77,284 @@ def vlen(text):
     return len(ANSI.sub("", text))
 
 
-def accent_rgb():
-    """The active theme's accent colour, defaulting to Omarchy pink."""
+def parse_hex(value):
+    """#RRGGBB (or RRGGBB) as an (r, g, b) tuple, or None."""
+    value = (value or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        return None
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def accent_arg(value):
+    rgb = parse_hex(value)
+    if rgb is None:
+        raise argparse.ArgumentTypeError("expected a #RRGGBB colour")
+    return rgb
+
+
+def env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_settings(path):
+    """Read the config file, then apply the environment overrides."""
+    settings = Settings()
+    raw = {}
+
+    parser = configparser.ConfigParser(interpolation=None)
     try:
-        with open(os.path.join(THEME_STATE, "theme/colors.toml"), encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        return (255, 20, 147)
+        parser.read(path)
+    except (configparser.Error, OSError):
+        pass
+    if parser.has_section("about"):
+        raw = {key: parser.get("about", key) for key in parser.options("about")}
 
-    match = re.search(r'^accent\s*=\s*"#?([0-9a-fA-F]{6})"', text, re.M)
+    def text(key, default, allowed):
+        value = raw.get(key, "").strip().lower()
+        return value if value in allowed else default
+
+    def number(key, default, low, high):
+        try:
+            value = float(raw.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value):
+            return default
+        return max(low, min(high, value))
+
+    def flag(key, default):
+        value = raw.get(key)
+        if value is None:
+            return default
+        value = value.strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True
+        if value in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    settings.mode = text("mode", "theme", ("theme", "wallpaper", "blend"))
+    settings.glint = text("glint", "white", ("white", "theme"))
+    settings.fps = int(number("fps", 24, 1, 60))
+    settings.speed = number("speed", 2.2, 0.1, 10.0)
+    settings.inset = int(number("inset", 2, 0, 20))
+    settings.gap = int(number("gap", 6, 1, 40))
+    settings.fade = number("fade", 0.35, 0.0, 2.0)
+    settings.crossfade = number("crossfade", 0.35, 0.0, 2.0)
+    settings.pause_unfocused = flag("pause_unfocused", True)
+
+    if env_flag("OMARCHY_ABOUT_STATIC"):
+        settings.static = True
+    accent = parse_hex(os.environ.get("OMARCHY_ABOUT_ACCENT"))
+    if accent:
+        settings.accent = accent
+
+    return settings
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="omarchy-about-animated",
+        description="Animated Omarchy About screen.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "config file:\n"
+            "  %s\n\n"
+            "accent modes:\n"
+            "  theme      follow the active Omarchy theme (default)\n"
+            "  wallpaper  take the most vibrant colour from the wallpaper\n"
+            "  blend      mix the theme accent with the wallpaper colour\n"
+            % CONFIG_FILE
+        ),
+    )
+    parser.add_argument("--config", metavar="PATH",
+                        help="read settings from PATH")
+    parser.add_argument("--mode", choices=("theme", "wallpaper", "blend"),
+                        help="where the accent colour comes from")
+    parser.add_argument("--glint", choices=("white", "theme"),
+                        help="use a white glint or the theme's color5")
+    parser.add_argument("--accent", type=accent_arg, metavar="#RRGGBB",
+                        help="pin the accent to a fixed colour")
+    parser.add_argument("--static", action="store_true",
+                        help="draw one static frame (no animation)")
+    parser.add_argument("--fps", type=int, metavar="N",
+                        help="animation frame rate (1-60)")
+    parser.add_argument("--speed", type=float, metavar="N",
+                        help="sheen speed (0.1-10)")
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s " + VERSION)
+    return parser.parse_args(argv)
+
+
+def apply_args(settings, args):
+    if args.mode:
+        settings.mode = args.mode
+    if args.glint:
+        settings.glint = args.glint
+    if args.accent:
+        settings.accent = args.accent
+    if args.static:
+        settings.static = True
+    if args.fps is not None:
+        settings.fps = max(1, min(60, args.fps))
+    if args.speed is not None:
+        settings.speed = max(0.1, min(10.0, args.speed))
+
+
+def read_color(text, key):
+    match = re.search(r'^%s\s*=\s*"#?([0-9a-fA-F]{6})"' % key, text, re.M)
     if not match:
-        return (255, 20, 147)
-
+        return None
     value = match.group(1)
     return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def theme_colors():
+    """The active theme's accent and its secondary (color5) colour."""
+    try:
+        with open(THEME_COLORS, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+
+    accent = read_color(text, "accent") or DEFAULT_ACCENT
+    secondary = read_color(text, "color5") or read_color(text, "color4") or accent
+    return accent, secondary
+
+
+def wallpaper_key():
+    """Identity of the current wallpaper, or None when there is no link."""
+    try:
+        path = os.path.realpath(BACKGROUND_LINK)
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (path, stat.st_mtime_ns, stat.st_size)
+
+
+def read_wallpaper_cache():
+    try:
+        with open(WALLPAPER_CACHE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("key"), data.get("rgb")
+    except (OSError, ValueError, AttributeError):
+        return None, None
+
+
+def cached_wallpaper(key):
+    """(hit, colour) from the on-disk sample cache."""
+    cached_key, cached_rgb = read_wallpaper_cache()
+    if cached_key == list(key):
+        return True, tuple(cached_rgb) if cached_rgb else None
+    return False, None
+
+
+def write_wallpaper_cache(key, rgb):
+    try:
+        os.makedirs(os.path.dirname(WALLPAPER_CACHE), exist_ok=True)
+        with open(WALLPAPER_CACHE, "w", encoding="utf-8") as fh:
+            json.dump({
+                "key": list(key) if key else None,
+                "rgb": list(rgb) if rgb else None,
+            }, fh)
+    except OSError:
+        pass
+
+
+def wallpaper_rgb(key=None):
+    """The most vibrant colour in the wallpaper, or None if it is too dull.
+
+    Runs ImageMagick, so the result is cached by wallpaper_key(); this is
+    only ever called when the wallpaper (or the settings) change, never per
+    frame.
+    """
+    if key is None:
+        key = wallpaper_key()
+    if not key:
+        return None
+
+    hit, cached = cached_wallpaper(key)
+    if hit:
+        return cached
+
+    try:
+        result = subprocess.run(
+            ["magick", key[0], "-resize", "10%", "-colors", "10",
+             "-depth", "8", "-format", "%c", "histogram:info:-"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    rows = re.findall(r"(\d+):.*#([0-9A-Fa-f]{6})", result.stdout)
+    total = sum(int(count) for count, _ in rows)
+    if not rows or not total:
+        write_wallpaper_cache(key, None)
+        return None
+
+    best = None
+    best_score = 0.0
+    for count, value in rows:
+        rgb = tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        _, lightness, saturation = colorsys.rgb_to_hls(*rgb)
+        score = saturation * (0.35 + lightness) * (int(count) / total) ** 0.5
+        if score > best_score:
+            best_score, best = score, rgb
+
+    # Grey or very dark wallpapers would vanish on the black About
+    # background; let the caller fall back to the theme accent instead.
+    if best is None or best_score < 0.08:
+        write_wallpaper_cache(key, None)
+        return None
+
+    hue, _, saturation = colorsys.rgb_to_hls(*best)
+    rgb = colorsys.hls_to_rgb(hue, 0.62, max(saturation, 0.55))
+    picked = tuple(round(channel * 255) for channel in rgb)
+    write_wallpaper_cache(key, picked)
+    return picked
+
+
+class WallpaperSampler:
+    """Sample the wallpaper on a worker thread so the sheen never stalls.
+
+    ImageMagick takes about a second on a full-size wallpaper. Rather than
+    freezing the render loop, the About opens in the theme accent and
+    crossfades to the wallpaper colour when the sample lands.
+    """
+
+    def __init__(self):
+        self.key = None
+        self.rgb = None
+        self.done = True
+        self.thread = None
+
+    def seed(self, key, rgb):
+        """Use an already-known sample without running ImageMagick."""
+        self.key = key
+        self.rgb = rgb
+        self.done = True
+
+    def request(self, key):
+        if not key or key == self.key:
+            return
+        self.key = key
+        self.rgb = None
+        self.done = False
+        self.thread = threading.Thread(target=self._sample, args=(key,),
+                                       daemon=True)
+        self.thread.start()
+
+    def _sample(self, key):
+        try:
+            rgb = wallpaper_rgb(key)
+        except Exception:
+            # A broken wallpaper must never take the render loop down.
+            rgb = None
+        if key == self.key:
+            self.rgb = rgb
+            self.done = True
 
 
 def load_logo():
@@ -202,11 +495,41 @@ def mix(a, b, amount):
     return tuple(round(a[i] + (b[i] - a[i]) * amount) for i in range(3))
 
 
-def paint(logo, elapsed, base):
-    """Return the logo rows with a moving accent sheen, as ANSI strings."""
-    highlight = mix(base, (255, 255, 255), 0.82)
-    glow = mix(base, (255, 255, 255), 0.28)
+def resolve_base(settings, theme_accent, wallpaper):
+    """The colour the logo is drawn in for the current settings."""
+    if settings.accent:
+        return settings.accent
+    if settings.mode == "wallpaper":
+        return wallpaper or theme_accent
+    if settings.mode == "blend":
+        return mix(theme_accent, wallpaper, 0.45) if wallpaper else theme_accent
+    return theme_accent
 
+
+def displayed_base(now, target, previous, started, duration):
+    """The accent to draw right now, mid-way through a crossfade."""
+    if previous is None or duration <= 0:
+        return target
+    amount = min(1.0, (now - started) / duration)
+    return mix(previous, target, amount)
+
+
+def paint(logo, elapsed, base, secondary, settings, level=1.0):
+    """Return the logo rows with a moving accent sheen, as ANSI strings."""
+    if settings.glint == "theme":
+        glow = mix(base, secondary, 0.30)
+        highlight = mix(base, mix(secondary, WHITE, 0.45), 0.85)
+    else:
+        glow = mix(base, WHITE, 0.28)
+        highlight = mix(base, WHITE, 0.82)
+
+    # Startup fade-in: the logo comes up from black over `fade` seconds.
+    if level < 1.0:
+        base = mix((0, 0, 0), base, level)
+        glow = mix((0, 0, 0), glow, level)
+        highlight = mix((0, 0, 0), highlight, level)
+
+    animated = not settings.static
     rows = []
     for y, line in enumerate(logo):
         cells = []
@@ -215,14 +538,17 @@ def paint(logo, elapsed, base):
                 cells.append(" ")
                 continue
 
-            # Diagonal band travelling across the logo, sharpened so it reads
-            # as a glint rather than a flat gradient.
-            wave = math.sin(x * 0.26 + y * 0.46 - elapsed * 2.2)
-            sheen = max(0.0, wave) ** 6
+            if animated:
+                # Diagonal band travelling across the logo, sharpened so it
+                # reads as a glint rather than a flat gradient.
+                wave = math.sin(x * 0.26 + y * 0.46 - elapsed * settings.speed)
+                sheen = max(0.0, wave) ** 6
 
-            # A slow breath keeps the whole mark alive between glints.
-            breath = 0.5 + 0.5 * math.sin(elapsed * 0.9)
-            colour = mix(mix(base, glow, 0.30 * breath), highlight, sheen)
+                # A slow breath keeps the whole mark alive between glints.
+                breath = 0.5 + 0.5 * math.sin(elapsed * 0.9)
+                colour = mix(mix(base, glow, 0.30 * breath), highlight, sheen)
+            else:
+                colour = base
 
             cells.append("\033[38;2;%d;%d;%dm%s" % (colour[0], colour[1], colour[2], char))
         rows.append("".join(cells) + "\033[0m")
@@ -258,7 +584,7 @@ def stretch_rows(rows, target):
     return scaled
 
 
-def layout_target(logo_rows, info):
+def layout_target(logo_rows, info, settings):
     """The tightest grid that still fits the logo and the three boxes."""
     logo_w = vlen(logo_rows[0]) if logo_rows else 0
     info_w = max((vlen(line.rstrip()) for line in info), default=0)
@@ -266,22 +592,22 @@ def layout_target(logo_rows, info):
 
     content_rows = max(last + 1, first + len(logo_rows))
     return (
-        PAD_LEFT + logo_w + GAP + info_w + PAD_RIGHT,
+        PAD_LEFT + logo_w + settings.gap + info_w + PAD_RIGHT,
         content_rows,
     )
 
 
-def compose(logo_rows, info, cols, rows):
+def compose(logo_rows, info, cols, rows, settings):
     """Lay the logo and the boxes out with the logo boxed inside the stack.
 
-    The logo is stretched to the height of the boxes minus LOGO_INSET on each
+    The logo is stretched to the height of the boxes minus the inset on each
     side, so there is even breathing room above and below it.
     """
     logo_w = vlen(logo_rows[0]) if logo_rows else 0
     first, last = info_bounds(info)
 
-    top = first + LOGO_INSET
-    bottom = last - LOGO_INSET
+    top = first + settings.inset
+    bottom = last - settings.inset
     if bottom < top:
         top, bottom = first, last
 
@@ -298,7 +624,7 @@ def compose(logo_rows, info, cols, rows):
             left = " " * logo_w
 
         right = info[index] if index < len(info) else ""
-        row = " " * PAD_LEFT + left + " " * GAP + right
+        row = " " * PAD_LEFT + left + " " * settings.gap + right
         lines.append(row.rstrip())
 
     # Never draw more rows than the terminal has, so the frame stays stable.
@@ -312,74 +638,240 @@ def file_mtime(path):
         return 0.0
 
 
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+    settings_path = os.path.expanduser(args.config or CONFIG_FILE)
+    settings = load_settings(settings_path)
+    apply_args(settings, args)
+
     logo_raw = load_logo()
     if not logo_raw:
         print("omarchy-about-animated: %s missing" % LOGO_FILE)
         return 1
 
     info = load_info()
-    debug("startup: logo=%d info=%d bounds=%s target=%s"
-          % (len(logo_raw), len(info), info_bounds(info), layout_target(logo_raw, info)))
-    fit_window(*layout_target(logo_raw, info))
+    debug("startup: version=%s mode=%s glint=%s logo=%d info=%d target=%s"
+          % (VERSION, settings.mode, settings.glint, len(logo_raw), len(info),
+             layout_target(logo_raw, info, settings)))
+    fit_window(*layout_target(logo_raw, info, settings))
     info = load_info() or info
-    fit_window(*layout_target(logo_raw, info))
+    fit_window(*layout_target(logo_raw, info, settings))
     info = load_info() or info
 
-    base = accent_rgb()
-    theme_file = os.path.join(THEME_STATE, "theme/colors.toml")
+    theme_accent, secondary = theme_colors()
+    wallpaper = None
+    wallpaper_now = wallpaper_key()
+    sampler = WallpaperSampler()
+    if (settings.mode in ("wallpaper", "blend") and not settings.accent
+            and wallpaper_now):
+        hit, cached = cached_wallpaper(wallpaper_now)
+        if hit:
+            wallpaper = cached
+            sampler.seed(wallpaper_now, cached)
+        else:
+            sampler.request(wallpaper_now)
+
+    base_target = resolve_base(settings, theme_accent, wallpaper)
+    base_previous = None
+    base_started = 0.0
+
     last_logo = file_mtime(LOGO_FILE)
-    last_theme = file_mtime(theme_file)
+    last_theme = file_mtime(THEME_COLORS)
+    last_config = file_mtime(settings_path)
+    last_watch = 0.0
 
     stdout = sys.stdout
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
+
+    def stop(signum, frame):
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
+
     started = time.monotonic()
+    last_frame = started
+    elapsed = 0.0
     last_size = grid_size()
+    focused = True
+    pending = b""
+    dirty = True
 
     try:
         tty.setcbreak(fd)
-        stdout.write("\033[?25l")
+        # Hide the cursor and ask the terminal for focus in/out reports
+        # (private mode 1004), so the sheen can rest while we are in the
+        # background.
+        stdout.write("\033[?25l\033[?1004h")
         stdout.flush()
 
         while True:
+            now = time.monotonic()
+            dt = now - last_frame
+            last_frame = now
+
             cols, rows = grid_size()
             if (cols, rows) != last_size:
                 last_size = (cols, rows)
                 info = load_info() or info
+                dirty = True
 
-            # Editing the logo (Style -> About -> Edit Text / Set From Image)
-            # repaints the open window instead of needing a relaunch.
-            logo_mtime = file_mtime(LOGO_FILE)
-            if logo_mtime != last_logo:
-                last_logo = logo_mtime
-                logo_raw = load_logo() or logo_raw
-                debug("logo reloaded: %d rows" % len(logo_raw))
-                info = load_info() or info
-                fit_window(*layout_target(logo_raw, info))
-                last_size = grid_size()
+            # Watching a couple of times a second is plenty; stat() per frame
+            # would be pointless and wallpaper sampling is expensive.
+            if now - last_watch >= 0.4:
+                last_watch = now
+                recompute = False
 
-            # Switching theme retints the sheen without reopening About.
-            theme_mtime = file_mtime(theme_file)
-            if theme_mtime != last_theme:
-                last_theme = theme_mtime
-                base = accent_rgb()
+                # Editing the logo (Style -> About -> Edit Text / Set From
+                # Image) repaints the open window instead of needing a relaunch.
+                logo_mtime = file_mtime(LOGO_FILE)
+                if logo_mtime != last_logo:
+                    last_logo = logo_mtime
+                    logo_raw = load_logo() or logo_raw
+                    debug("logo reloaded: %d rows" % len(logo_raw))
+                    info = load_info() or info
+                    fit_window(*layout_target(logo_raw, info, settings))
+                    last_size = grid_size()
+                    dirty = True
 
-            elapsed = time.monotonic() - started
-            logo_rows = paint(logo_raw, elapsed, base)
-            frame = compose(logo_rows, info, cols, rows)
+                # Editing the config applies without reopening About.
+                config_mtime = file_mtime(settings_path)
+                if config_mtime != last_config:
+                    last_config = config_mtime
+                    fresh = load_settings(settings_path)
+                    apply_args(fresh, args)
+                    layout_changed = (fresh.inset != settings.inset
+                                      or fresh.gap != settings.gap)
+                    settings = fresh
+                    if layout_changed:
+                        fit_window(*layout_target(logo_raw, info, settings))
+                        last_size = grid_size()
+                    recompute = True
+                    dirty = True
 
-            stdout.write("\033[H\033[?2026h" + frame + "\033[?2026l")
-            stdout.flush()
+                # Switching theme retints the sheen, and usually swaps the
+                # wallpaper too.
+                theme_mtime = file_mtime(THEME_COLORS)
+                if theme_mtime != last_theme:
+                    last_theme = theme_mtime
+                    theme_accent, secondary = theme_colors()
+                    recompute = True
+                    dirty = True
 
-            if select.select([sys.stdin], [], [], max(0.0, 1.0 / FPS))[0]:
+                # Switching wallpaper (omarchy theme bg next) retints it as
+                # well when the accent follows the wallpaper. ImageMagick can
+                # take a second on a large image, so it runs on a worker
+                # thread and the sheen keeps moving with the theme accent
+                # until the sample lands.
+                need_wallpaper = (settings.mode in ("wallpaper", "blend")
+                                  and not settings.accent)
+                wallpaper_now = wallpaper_key()
+                if need_wallpaper and wallpaper_now:
+                    if sampler.key != wallpaper_now:
+                        # Keep the previous sample on screen until the new
+                        # one lands, then crossfade once instead of twice.
+                        sampler.request(wallpaper_now)
+                        recompute = True
+                        dirty = True
+                    elif sampler.done and sampler.rgb != wallpaper:
+                        wallpaper = sampler.rgb
+                        recompute = True
+                        dirty = True
+                else:
+                    wallpaper = None
+
+                if recompute:
+                    target = resolve_base(settings, theme_accent, wallpaper)
+                    if target != base_target:
+                        base_previous = displayed_base(
+                            now, base_target, base_previous, base_started,
+                            settings.crossfade)
+                        base_target = target
+                        base_started = now
+                        dirty = True
+
+            active = not settings.static and (
+                focused or not settings.pause_unfocused)
+            if active:
+                # Clamp the step so a pause or a stall cannot make the sheen
+                # jump across the logo when it resumes.
+                elapsed += min(dt, max(0.05, 2.0 / settings.fps))
+
+            if dirty or active:
+                base = (base_target if settings.static else
+                        displayed_base(now, base_target, base_previous,
+                                       base_started, settings.crossfade))
+                level = 1.0
+                if not settings.static and settings.fade > 0:
+                    level = min(1.0, elapsed / settings.fade)
+
+                logo_rows = paint(logo_raw, elapsed, base, secondary,
+                                  settings, level)
+                frame = compose(logo_rows, info, cols, rows, settings)
+
+                stdout.write("\033[H\033[?2026h" + frame + "\033[?2026l")
+                stdout.flush()
+                dirty = False
+
+            timeout = 1.0 / settings.fps if active else 0.5
+            if not select.select([fd], [], [], timeout)[0]:
+                continue
+
+            data = os.read(fd, 64)
+            debug("input: %r" % data)
+            if not data:
+                break
+
+            # Focus reports are handled; anything else (any key) closes the
+            # window, which is how the stock TUI About behaves.
+            pending += data
+            quit_now = False
+            while pending:
+                if len(pending) < 3 and pending.startswith(b"\x1b"):
+                    # A lone ESC, or a focus report split across reads. Give
+                    # the rest of the sequence a moment to arrive; if nothing
+                    # does, treat the ESC as a keypress and close.
+                    if not select.select([fd], [], [], 0.02)[0]:
+                        debug("lone ESC -> quit")
+                        quit_now = True
+                        break
+                    more = os.read(fd, 64)
+                    if not more:
+                        quit_now = True
+                        break
+                    pending += more
+                    continue
+                if pending.startswith(b"\x1b[I"):
+                    focused = True
+                    pending = pending[3:]
+                    dirty = True
+                elif pending.startswith(b"\x1b[O"):
+                    focused = False
+                    pending = pending[3:]
+                else:
+                    quit_now = True
+                    break
+            if quit_now:
+                debug("quit requested")
                 break
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
-        stdout.write("\033[0m\033[?25h")
-        stdout.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        debug("cleanup")
+        try:
+            stdout.write("\033[0m\033[?1004l\033[?25h")
+            stdout.flush()
+        except OSError:
+            pass
+        debug("cleanup flushed")
+        try:
+            # TCSANOW, not TCSADRAIN: a slow terminal must not keep the
+            # window alive after it has been dismissed.
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+        except (OSError, termios.error):
+            pass
+        debug("termios restored")
 
     return 0
 
